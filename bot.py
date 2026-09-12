@@ -17,7 +17,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = "8610317840:AAG7w-evFhK1QIzxmgA-tMDlb-BA35mhVSA"
+BOT_TOKEN = "8610317840:AAGOmZ3yPgqxxt-h1aLTyHOBf4RkPpyO90I"
 BATCH_SIZE = 100
 PROGRESS_INTERVAL = 10  # send json snapshot every N processed
 
