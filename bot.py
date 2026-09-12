@@ -11,6 +11,7 @@ from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -33,11 +34,10 @@ API_KEY_RE = re.compile(r"AIza[A-Za-z0-9_-]{35}")
 
 EXECUTOR = ThreadPoolExecutor(max_workers=8)
 chat_state = defaultdict(lambda: {"queue": [], "queue_msg_id": None})
+failed_store: dict = defaultdict(list)
 
-# store failed items per chat so retry/resend can access them
-# key: chat_id, value: list of {"file_id": ..., "file_name": ...}
-failed_store: dict[int, list] = defaultdict(list)
 
+# ─── APK scanning ─────────────────────────────────────────────────────────────
 
 def extract_from_apk_bytes(data):
     fb_url = ""
@@ -135,6 +135,8 @@ def extract_from_apk_bytes(data):
     }
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
 def url_to_name(url):
     host = url.split("//")[-1].split(".")[0]
     parts = host.replace("-", " ").split()
@@ -175,6 +177,34 @@ async def update_queue_message(chat_id, ctx, state):
     state["queue_msg_id"] = msg.message_id
 
 
+async def safe_edit(ctx, chat_id, message_id, text, parse_mode="Markdown"):
+    """Edit a message, silently ignore all failures."""
+    try:
+        await ctx.bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode=parse_mode,
+        )
+    except Exception:
+        pass
+
+
+async def send_with_retry(coro_fn, retries=3, delay=5):
+    """Call coro_fn() up to `retries` times on timeout/network errors."""
+    for attempt in range(retries):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ("timed out", "timeout", "readtimeout", "network")):
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+            raise
+    return None
+
+
 async def send_json_snapshot(chat_id, ctx, results, label):
     accounts = [
         {"name": d["name"], "url": d["url"], "key": d["keys"], "time": d["time"]}
@@ -183,33 +213,50 @@ async def send_json_snapshot(chat_id, ctx, results, label):
     output = {"accounts": accounts, "total": len(accounts)}
     output_json = json.dumps(output, indent=2, ensure_ascii=False)
 
-    if len(output_json) < 3500:
-        await ctx.bot.send_message(
-            chat_id,
-            f"📊 *{label}*\n```json\n{output_json}\n```",
-            parse_mode="Markdown",
-        )
-    else:
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(output_json)
-            tmp_path = f.name
-        with open(tmp_path, "rb") as f:
-            await ctx.bot.send_document(
+    try:
+        if len(output_json) < 3500:
+            await send_with_retry(lambda: ctx.bot.send_message(
                 chat_id,
-                document=f,
-                filename=f"firebase_{label.lower().replace(' ', '_')}.json",
-                caption=f"📊 {label} — {len(accounts)} unique configs.",
+                f"📊 *{label}*\n```json\n{output_json}\n```",
+                parse_mode="Markdown",
+            ))
+        else:
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", mode="w", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(output_json)
+                tmp_path = f.name
+            try:
+                with open(tmp_path, "rb") as f:
+                    file_data = f.read()
+                await send_with_retry(lambda: ctx.bot.send_document(
+                    chat_id,
+                    document=io.BytesIO(file_data),
+                    filename=f"firebase_{label.lower().replace(' ', '_')}.json",
+                    caption=f"📊 {label} — {len(accounts)} unique configs.",
+                ))
+            finally:
+                os.unlink(tmp_path)
+    except Exception as e:
+        # last resort — send as plain text message if file upload keeps failing
+        try:
+            short = json.dumps({"total": len(accounts), "note": "upload failed, partial"}, indent=2)
+            await ctx.bot.send_message(
+                chat_id,
+                f"⚠️ *{label}* — file upload failed ({e})\n"
+                f"Total unique configs: {len(accounts)}",
+                parse_mode="Markdown",
             )
-        os.unlink(tmp_path)
+        except Exception:
+            pass
 
+
+# ─── Batch processor ──────────────────────────────────────────────────────────
 
 async def process_batch(chat_id, ctx, batch):
     total = len(batch)
     state = chat_state[chat_id]
 
-    # clear queue message
     if state.get("queue_msg_id"):
         try:
             await ctx.bot.delete_message(chat_id, state["queue_msg_id"])
@@ -221,9 +268,10 @@ async def process_batch(chat_id, ctx, batch):
         chat_id,
         f"⚙️ Starting scan of {total} APKs...\n{build_progress_bar(0, total)}",
     )
+    pmid = progress_msg.message_id
 
     results = {}
-    failed_items = []   # list of {"file_id", "file_name", "reason"}
+    failed_items = []
     true_dupes = []
     done_count = 0
     last_snapshot_at = 0
@@ -241,22 +289,16 @@ async def process_batch(chat_id, ctx, batch):
         fail_reason = None
 
         async with semaphore:
-            # show: downloading
-            try:
-                await ctx.bot.edit_message_text(
-                    f"⚙️ Scanning {total} APKs...\n"
-                    f"{build_progress_bar(done_count, total)}\n"
-                    f"📥 Downloading: `{fname}`\n"
-                    f"✅ Found: {len(results)} | ❌ Failed: {len(failed_items)}",
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+            # ── downloading ──
+            await safe_edit(
+                ctx, chat_id, pmid,
+                f"⚙️ Scanning {total} APKs...\n"
+                f"{build_progress_bar(done_count, total)}\n"
+                f"📥 Downloading: `{fname}`\n"
+                f"✅ Found: {len(results)} | ❌ Failed: {len(failed_items)}",
+            )
 
             try:
-                # no timeout on download
                 tg_file = await ctx.bot.get_file(item["file_id"])
                 data = bytes(await tg_file.download_as_bytearray())
             except Exception as e:
@@ -267,23 +309,17 @@ async def process_batch(chat_id, ctx, batch):
                         "file_name": fname,
                         "reason": fail_reason,
                     })
-                async with lock:
                     done_count += 1
                 return
 
-            # show: processing
-            try:
-                await ctx.bot.edit_message_text(
-                    f"⚙️ Scanning {total} APKs...\n"
-                    f"{build_progress_bar(done_count, total)}\n"
-                    f"🔍 Processing: `{fname}`\n"
-                    f"✅ Found: {len(results)} | ❌ Failed: {len(failed_items)}",
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+            # ── processing ──
+            await safe_edit(
+                ctx, chat_id, pmid,
+                f"⚙️ Scanning {total} APKs...\n"
+                f"{build_progress_bar(done_count, total)}\n"
+                f"🔍 Processing: `{fname}`\n"
+                f"✅ Found: {len(results)} | ❌ Failed: {len(failed_items)}",
+            )
 
             try:
                 result = await asyncio.wait_for(
@@ -349,19 +385,14 @@ async def process_batch(chat_id, ctx, batch):
                 snapshot_results = dict(results)
                 snapshot_label = f"Snapshot at {current_done}/{total}"
 
-        # update progress after finishing this APK
-        try:
-            await ctx.bot.edit_message_text(
-                f"⚙️ Scanning {total} APKs...\n"
-                f"{build_progress_bar(current_done, total)}\n"
-                f"✅ Done: `{fname}`\n"
-                f"✅ Found: {len(results)} | ❌ Failed: {len(failed_items)}",
-                chat_id=chat_id,
-                message_id=progress_msg.message_id,
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
+        # ── done ──
+        await safe_edit(
+            ctx, chat_id, pmid,
+            f"⚙️ Scanning {total} APKs...\n"
+            f"{build_progress_bar(current_done, total)}\n"
+            f"✅ Done: `{fname}`\n"
+            f"✅ Found: {len(results)} | ❌ Failed: {len(failed_items)}",
+        )
 
         if snapshot_results is not None:
             await send_json_snapshot(chat_id, ctx, snapshot_results, snapshot_label)
@@ -370,59 +401,54 @@ async def process_batch(chat_id, ctx, batch):
     await asyncio.gather(*tasks)
 
     # final progress
-    try:
-        await ctx.bot.edit_message_text(
-            f"✅ Done! {build_progress_bar(total, total)}\n"
-            f"Unique: {len(results)} | Failed: {len(failed_items)} | Dupes: {len(true_dupes)}",
-            chat_id=chat_id,
-            message_id=progress_msg.message_id,
-        )
-    except Exception:
-        pass
+    await safe_edit(
+        ctx, chat_id, pmid,
+        f"✅ Done! {build_progress_bar(total, total)}\n"
+        f"Unique: {len(results)} | Failed: {len(failed_items)} | Dupes: {len(true_dupes)}",
+        parse_mode=None,
+    )
 
     await send_json_snapshot(chat_id, ctx, results, f"Final — {total} APKs")
 
-    # handle failed items
     if failed_items:
-        # store them for retry/resend
         failed_store[chat_id] = failed_items
-
         lines = [f"• `{x['file_name']}` — {x['reason']}" for x in failed_items[:50]]
         if len(failed_items) > 50:
             lines.append(f"_...and {len(failed_items) - 50} more_")
-
         fail_text = f"⚠️ *{len(failed_items)} Failed:*\n" + "\n".join(lines)
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 Retry failed", callback_data=f"retry:{chat_id}"),
-                InlineKeyboardButton("📤 Send APKs back", callback_data=f"resend:{chat_id}"),
-            ]
-        ])
-
-        await ctx.bot.send_message(
-            chat_id,
-            fail_text,
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Retry failed", callback_data=f"retry:{chat_id}"),
+            InlineKeyboardButton("📤 Send APKs back", callback_data=f"resend:{chat_id}"),
+        ]])
+        try:
+            await ctx.bot.send_message(
+                chat_id, fail_text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
 
     if true_dupes:
         dupe_text = "🔁 *Duplicates:*\n" + "\n".join(f"• `{x}`" for x in true_dupes[:30])
         if len(true_dupes) > 30:
             dupe_text += f"\n_{len(true_dupes) - 30} more..._"
-        await ctx.bot.send_message(chat_id, dupe_text, parse_mode="Markdown")
+        try:
+            await ctx.bot.send_message(chat_id, dupe_text, parse_mode="Markdown")
+        except Exception:
+            pass
 
+
+# ─── Callback handler ─────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
-    action, chat_id_str = data.split(":", 1)
+    action, chat_id_str = query.data.split(":", 1)
     chat_id = int(chat_id_str)
-
     items = failed_store.get(chat_id, [])
+
     if not items:
         await query.edit_message_reply_markup(reply_markup=None)
         await ctx.bot.send_message(chat_id, "No failed APKs stored.")
@@ -432,7 +458,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         failed_store[chat_id] = []
         await ctx.bot.send_message(chat_id, f"🔄 Retrying {len(items)} failed APKs...")
-        # strip reason, keep file_id + file_name
         batch = [{"file_id": x["file_id"], "file_name": x["file_name"]} for x in items]
         await process_batch(chat_id, ctx, batch)
 
@@ -441,19 +466,24 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id, f"📤 Sending back {len(items)} APKs...")
         for item in items:
             try:
-                await ctx.bot.send_document(
+                await send_with_retry(lambda i=item: ctx.bot.send_document(
                     chat_id,
-                    document=item["file_id"],
-                    caption=f"`{item['file_name']}` — {item['reason']}",
+                    document=i["file_id"],
+                    caption=f"`{i['file_name']}` — {i['reason']}",
                     parse_mode="Markdown",
-                )
+                ))
             except Exception as e:
-                await ctx.bot.send_message(
-                    chat_id,
-                    f"⚠️ Failed to resend `{item['file_name']}`: {e}",
-                    parse_mode="Markdown",
-                )
+                try:
+                    await ctx.bot.send_message(
+                        chat_id,
+                        f"⚠️ Failed to resend `{item['file_name']}`: {e}",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
 
+
+# ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async def start(update, ctx):
     await update.message.reply_text(
@@ -523,8 +553,22 @@ async def clear(update, ctx):
     await update.message.reply_text("🗑️ Queue cleared.")
 
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # bump read/write timeouts so large JSON uploads don't time out
+    request = HTTPXRequest(
+        read_timeout=300,
+        write_timeout=300,
+        connect_timeout=30,
+        pool_timeout=60,
+    )
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("flush", flush))
     app.add_handler(CommandHandler("status", status))
